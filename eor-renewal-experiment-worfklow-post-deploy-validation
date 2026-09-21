@@ -1,0 +1,514 @@
+### Post-Deploy Validation Skill - EOR Renewal Experiment Workflow
+
+This skill validates recently launched Hivemind experiments by checking audience recording data flow and experiment health.
+
+**Workflow scope:** Validation workflow only (workflow_intent = validate_experiment).
+
+**CRITICAL: Single ticket only:**
+- Validate ONLY the experiment from the Jira ticket provided by the user
+- Do NOT search for other tickets with similar experiment names
+- Do NOT infer or reference other tickets even if experiment names contain ticket IDs
+- Do NOT attempt to find related experiments or prior versions
+- Use only the Hivemind experiment URL from the provided ticket
+
+**Do not use this skill for:**
+- Ticket creation (use T1-T4)
+- Opportunity sizing (use S1-S12)
+- Experiment setup (use E1-E11)
+- Gathering results (use R1-R8)
+
+## Gate sequence
+
+**IMPORTANT: V3 requires experiment_name from V4, so execution order is V1 → V2 → V4 → V3 → V5 → V6**
+
+| Gate | Requirement |
+|---|---|
+| V1 | Jira ticket retrieved, Hivemind experiment ID and launch date extracted |
+| V2 | Helix conversation session established |
+| V4 | Hivemind experiment details retrieved via MCP (provides experiment_name) |
+| V3 | Audience recording data validated using experiment_name from V4 |
+| V5 | Count comparison complete (audience recording vs Hivemind) |
+| V6 | Validation results posted as Jira comment |
+
+**Gate order rationale:**
+- V4 must execute before V3 because V3 needs the experiment_name from Hivemind
+- V3 uses both experiment_name (from V4) and experiment_launch_date (from V1) in its query
+
+## Dependencies
+
+Before V1, ensure:
+- `validation_dependency_load_complete = false` initially
+- Load shared constants if not already loaded this session
+- Retrieve Jira ticket data if not already retrieved
+
+## V1: Extract Hivemind experiment ID and launch date from Jira
+
+**Requirement:** Parse the Hivemind URL from Jira to extract experiment_id, and extract the experiment launch date from Jira.
+
+**Field mappings source:** Confluence page 4559275097 (Commonly Used Jira Custom Fields)
+- If field mappings are already loaded in shared constants from this session, reuse them
+- If not loaded, the shared constants skill will fetch and parse the Confluence field mappings table
+- Find the custom field ID for "Launch Date" or "Start Date" from the mapping table
+- Fall back to checking common date fields if mapping unavailable
+
+**Hivemind URL field:** `customfield_21532` (Hivemind URL) or as listed in field mappings
+
+**Expected Hivemind URL formats:**
+- `https://hivemind.int.godaddy.com/v2/experiment/{experiment_id}`
+- `https://hivemind.int.godaddy.com/experiments/{experiment_id}`
+
+**Extraction logic:**
+1. Read Hivemind URL from the provided Jira ticket ONLY (no searching other tickets)
+2. Extract experiment_id (numeric or UUID pattern after `/experiment/` or `/experiments/`)
+3. Store as `hivemind_experiment_id` in state
+4. Read launch date field from Jira ticket using the field ID from Confluence mappings
+5. If launch date is empty/null, use Hivemind experiment start date (obtained in V4) as fallback
+6. Store as `experiment_launch_date` in state (format: YYYY-MM-DD)
+7. Do NOT search for other tickets or experiments at this stage
+
+**IMPORTANT:** 
+- Validate ONLY the experiment from the provided Jira ticket
+- The experiment_name used in V3 query comes from Hivemind MCP response in V4, NOT from Jira ticket fields
+- The launch date ensures validation only checks audience recording and Hivemind data on/after the experiment actually launched
+- Do NOT infer experiment name from ticket IDs, ticket keys, or similar patterns
+
+**If Hivemind URL is missing or malformed:**
+- Set `validation_v1_blocked = true`
+- Report to user: "Cannot proceed - Jira ticket {ticket_key} has no valid Hivemind URL. Please add the Hivemind experiment link to continue."
+- Stop at V1
+
+**On success:**
+- Set `validation_v1_complete = true`
+- Set `current_gate = "V2"`
+- Display: "✓ Found Hivemind experiment: {experiment_id}"
+- Continue to V2
+
+## V2: Establish Helix conversation session
+
+**Requirement:** Get or create a Helix conversation_id for validation queries.
+
+**Delegation:** Invoke `eor-renewal-experiment-worfklow-helix-conversation-session.md` exactly once before first Helix query.
+
+**Session manager will:**
+- Check if `helix_conversation_id` is already set
+- Reuse if valid and created for this workflow_intent + jira_ticket
+- Create new session if needed
+- Validate as UUID v4
+- Set state flags appropriately
+
+**After session manager returns:**
+- Verify `helix_conversation_id` is set
+- Verify `helix_conversation_id_validated = true`
+- Set `validation_v2_complete = true`
+- Set `current_gate = "V3"`
+- Continue to V3
+
+**If session creation fails:**
+- Set `validation_v2_blocked = true`
+- Report error to user
+- Ask whether to retry or abort
+
+## V3: Validate audience recording data via Helix
+
+**Requirement:** Query MessageGears audience recording table to validate data exists and is complete.
+
+**Query structure:**
+```sql
+select
+    count(distinct a.customer_id) as distinct_shoppers,
+    count(distinct a.resource_id) as distinct_resources,
+    count(*) as total_rows,
+    min(a.audience_generation_mst_ts) as earliest_generation_ts,
+    max(a.audience_generation_mst_ts) as latest_generation_ts,
+    count(distinct a.external_campaign_name) as distinct_campaigns,
+    count(distinct case
+        when a.external_campaign_name ~* '_EM_' then 'Email'
+        when a.external_campaign_name ~* '_SMS_' then 'SMS'
+        when a.external_campaign_name ~* '_WA_' then 'WhatsApp'
+        when a.external_campaign_name ~* '_PUSH_' then 'Push'
+        when a.external_campaign_name ~* '_IVR_' then 'IVR'
+        else 'Other'
+    end) as distinct_channels,
+    sum(case when a.customer_id is null then 1 else 0 end) as null_customer_ids,
+    sum(case when a.resource_id is null then 1 else 0 end) as null_resource_ids
+from message_gears_cln.standard_audience_recording_cln a
+where lower(a.experiment_name) = lower('{experiment_name}')
+    and a.audience_generation_mst_ts::date >= '{experiment_launch_date}'::date
+    and lower(a.external_campaign_name) not like '%bucketing%'
+    and lower(a.external_campaign_name) not like '%seed%'
+```
+
+**Query parameter sources:**
+- `{experiment_name}`: Comes from Hivemind MCP response in V4 (NOT from Jira ticket)
+- `{experiment_launch_date}`: Comes from Jira ticket launch date field (extracted in V1), format YYYY-MM-DD
+
+**IMPORTANT - experiment_name source:**
+- The `{experiment_name}` placeholder comes from the Hivemind MCP response in V4
+- Do NOT derive experiment_name from the Jira ticket key or infer from ticket fields
+- Wait until V4 completes and use the experiment name returned by Hivemind API
+- This ensures exact matching between what Hivemind knows and what audience recording contains
+
+**Launch date filter:**
+- Only includes audience recording data on or after the experiment's actual launch date
+- Prevents false negatives from pre-launch test data or prior experiments with similar names
+- Uses `audience_generation_mst_ts::date` for date comparison (ignores time component)
+
+**Campaign exclusions:**
+- Excludes campaigns with "bucketing" in the name (test/control assignment campaigns)
+- Excludes campaigns with "seed" in the name (seed list/test campaigns)
+- These are operational campaigns, not the actual experiment audience
+
+**Verbosity requirement - Silent execution:**
+
+Do not provide intermediate reasoning, exploration updates, progress messages, query-planning commentary, or status logs while this query runs. Perform execution silently and return only the final count/completeness results defined below.
+
+**Query execution:**
+1. Submit the query via Helix MCP with explicit Analysis Agent routing:
+   ```json
+   {
+     "conversation_id": "{helix_conversation_id}",
+     "agent": "analysis",
+     "instructions": "Run the Analysis Agent to answer the SQL query. Use the SQL provided below. Do not perform schema discovery. Do not search for alternate tables. Do not validate against unrelated datasets. Execute the query and return results only."
+   }
+   ```
+   This routing is required, not optional — the Helix team has confirmed it materially reduces execution time versus implicit agent selection, the same as for S9-S10 sizing queries.
+2. Pass `helix_conversation_id` from V2.
+3. Immediately invoke `eor-renewal-experiment-worfklow-helix-status-poll.md`. Pass state: `{helix_conversation_id, max_wait_seconds: 300}`. Do not reload this full validation skill's prompt during status checks — the status-poll skill handles polling silently and returns only final status.
+4. When the status poll returns `status="completed"`, process results from `response.result`.
+5. If the status poll returns `status="error"` or `"timeout"`, handle per the Error handling section below.
+
+**Validation checks:**
+
+**Check 1 - Data exists:**
+- If `total_rows = 0`: CRITICAL failure
+- Report: "❌ CRITICAL: No audience recording data found for experiment '{experiment_name}'"
+- Set `validation_v3_blocked = true`
+- Ask user whether to continue with Hivemind-only checks or abort
+
+**Check 2 - Completeness:**
+- If `null_customer_ids > 0`: WARNING
+- Report: "⚠️ Found {null_customer_ids} rows with null customer_id ({pct}% of total)"
+- If `null_resource_ids > 0`: WARNING
+- Report: "⚠️ Found {null_resource_ids} rows with null resource_id ({pct}% of total)"
+
+**Check 3 - Timestamp sanity:**
+- Validate `earliest_generation_ts` and `latest_generation_ts` are reasonable
+- If span > 7 days: CAUTIONARY
+- Report: "⚠️ Audience generation spans {days} days (earliest: {earliest}, latest: {latest})"
+
+**Store results:**
+- `audience_recording_shoppers = distinct_shoppers`
+- `audience_recording_resources = distinct_resources`
+- `audience_recording_total_rows = total_rows`
+- `audience_recording_campaigns = distinct_campaigns`
+- `audience_recording_channels = distinct_channels`
+
+**On success:**
+- Set `validation_v3_complete = true`
+- Set `current_gate = "V5"`
+- Display summary:
+  ```
+  ✓ Audience Recording Data Found (on/after {experiment_launch_date})
+  - Shoppers: {distinct_shoppers:,}
+  - Resources: {distinct_resources:,}
+  - Total rows: {total_rows:,}
+  - Campaigns: {distinct_campaigns}
+  - Channels: {distinct_channels}
+  - Time span: {earliest} to {latest}
+  ```
+- Continue to V5
+
+## V4: Validate Hivemind experiment via MCP (EXECUTES BEFORE V3)
+
+**IMPORTANT:** This gate executes immediately after V2, BEFORE V3, because V3 needs the experiment_name from this step.
+
+**Requirement:** Use Hivemind MCP to get experiment details and validate experiment health.
+
+**MCP tool calls needed:**
+
+**Call 1 - Get experiment details:**
+Use `mcp__hivemind__getExperiment` with `experiment_id` from V1.
+
+**Extract:**
+- Experiment name (CRITICAL - required for V3 query)
+- Status (running, completed, etc.)
+- Start date, end date
+- Variant names and allocation percentages
+
+**Call 2 - Check for errors:**
+Check the experiment response for:
+- SRM (Sample Ratio Mismatch) errors
+- Metric calculation errors
+- Data quality warnings
+- Any error flags in the response
+
+**Call 3 - Get sample sizes:**
+Extract from experiment response:
+- Total sample size
+- Per-variant sample sizes
+- Expected vs actual allocation
+
+**Validation checks:**
+
+**Check 1 - Experiment exists:**
+- If MCP call fails or returns 404: CRITICAL failure
+- Report: "❌ CRITICAL: Hivemind experiment {experiment_id} not found or inaccessible"
+- Set `validation_v4_blocked = true`
+- Stop validation
+
+**Check 2 - SRM check:**
+- If SRM error detected: CRITICAL warning
+- Report: "❌ CRITICAL: Sample Ratio Mismatch detected in Hivemind experiment"
+- Include SRM details (expected vs actual allocation)
+
+**Check 3 - Metric errors:**
+- If metric errors detected: WARNING
+- Report: "⚠️ Metric calculation errors detected: {error_details}"
+
+**Check 4 - Data flow:**
+- If sample size = 0: CRITICAL failure
+- Report: "❌ CRITICAL: Hivemind experiment has 0 sample size - no data flowing"
+- If sample size < expected (from audience recording): WARNING
+- Report: "⚠️ Hivemind sample size ({hivemind_count}) less than expected from audience recording ({audience_count})"
+
+**Store results:**
+- `hivemind_total_sample_size = total_sample_size`
+- `hivemind_experiment_status = status`
+- `hivemind_srm_detected = true/false`
+- `hivemind_metric_errors = error_list`
+- `hivemind_experiment_name = name`
+
+**On success:**
+- Set `validation_v4_complete = true`
+- Store `hivemind_experiment_name` (required for V3)
+- Set `current_gate = "V3"` (now that we have experiment_name, execute V3)
+- Display summary:
+  ```
+  ✓ Hivemind Experiment Details Retrieved
+  - Name: {experiment_name}
+  - Status: {status}
+  - Total sample: {total_sample_size:,}
+  - SRM detected: {srm_status}
+  - Metric errors: {error_count}
+  ```
+- Continue to V3 (audience recording validation using experiment_name)
+
+## V5: Compare counts and calculate deltas
+
+**Requirement:** Compare audience recording counts vs Hivemind counts and flag discrepancies.
+
+**Count comparison:**
+
+**Shopper count delta:**
+```
+delta_shoppers = audience_recording_shoppers - hivemind_total_sample_size
+delta_shoppers_pct = (delta_shoppers / audience_recording_shoppers) * 100
+```
+
+**Threshold logic:**
+- If `abs(delta_shoppers_pct) >= 5%`: CRITICAL warning
+  - Report: "❌ CRITICAL: Shopper count mismatch ≥5% (Δ={delta_shoppers_pct:.1f}%)"
+- Else if `abs(delta_shoppers_pct) > 0%`: CAUTIONARY warning
+  - Report: "⚠️ CAUTION: Shopper count mismatch detected (Δ={delta_shoppers_pct:.1f}%)"
+- Else: OK
+  - Report: "✓ Shopper counts match"
+
+**Detailed comparison:**
+```
+Audience Recording: {audience_recording_shoppers:,} shoppers
+Hivemind Experiment: {hivemind_total_sample_size:,} shoppers
+Delta: {delta_shoppers:,} ({delta_shoppers_pct:+.2f}%)
+```
+
+**Resource count validation:**
+If resource counts available from Hivemind (not all experiments track resources):
+```
+delta_resources = audience_recording_resources - hivemind_resources
+delta_resources_pct = (delta_resources / audience_recording_resources) * 100
+```
+
+Apply same threshold logic as shoppers.
+
+**Overall validation status:**
+
+Determine final status:
+- **PASS**: No critical warnings, cautionary warnings acceptable
+- **PASS_WITH_WARNINGS**: No critical warnings, but cautionary warnings present
+- **FAIL**: Any critical warning present (≥5% mismatch, SRM, missing data, metric errors)
+
+**Store results:**
+- `validation_delta_shoppers = delta_shoppers`
+- `validation_delta_shoppers_pct = delta_shoppers_pct`
+- `validation_status = PASS/PASS_WITH_WARNINGS/FAIL`
+- `validation_critical_warnings = list`
+- `validation_cautionary_warnings = list`
+
+**On completion:**
+- Set `validation_v5_complete = true`
+- Set `current_gate = "V6"`
+- Display summary:
+  ```
+  Validation Summary
+  Status: {validation_status}
+  
+  Count Comparison:
+  - Audience Recording: {audience_recording_shoppers:,} shoppers, {audience_recording_resources:,} resources
+  - Hivemind Experiment: {hivemind_total_sample_size:,} shoppers
+  - Delta: {delta_shoppers:,} shoppers ({delta_shoppers_pct:+.1f}%)
+  
+  Critical Warnings: {count}
+  {list critical warnings if any}
+  
+  Cautionary Warnings: {count}
+  {list cautionary warnings if any}
+  ```
+- Continue to V6
+
+## V6: Post validation results to Jira
+
+**Requirement:** Add validation results as a comment on the Jira ticket.
+
+**Dry run first:**
+Show user the comment that will be posted:
+
+```
+--- Dry Run: Jira Comment Preview ---
+
+Post-Deploy Validation Results
+Experiment: {experiment_name}
+Hivemind ID: {experiment_id}
+Validation Date: {current_date}
+
+OVERALL STATUS: {validation_status}
+
+Audience Recording Data (MessageGears):
+✓ Shoppers: {audience_recording_shoppers:,}
+✓ Resources: {audience_recording_resources:,}
+✓ Total rows: {total_rows:,}
+✓ Campaigns: {distinct_campaigns}
+✓ Channels: {distinct_channels}
+✓ Generation timespan: {earliest} to {latest}
+
+Hivemind Experiment Status:
+✓ Status: {status}
+✓ Total sample: {hivemind_total_sample_size:,}
+✓ SRM detected: {Yes/No}
+✓ Metric errors: {count or None}
+
+Count Comparison:
+- Audience Recording shoppers: {audience_recording_shoppers:,}
+- Hivemind experiment shoppers: {hivemind_total_sample_size:,}
+- Delta: {delta_shoppers:,} ({delta_shoppers_pct:+.1f}%)
+- Threshold status: {PASS/CAUTION/CRITICAL}
+
+{if critical_warnings}
+❌ CRITICAL WARNINGS ({count}):
+{list each warning}
+{endif}
+
+{if cautionary_warnings}
+⚠️ CAUTIONARY WARNINGS ({count}):
+{list each warning}
+{endif}
+
+Validated by: Claude Experiment Workflow Agent v2.2.0
+
+--- End Preview ---
+
+Post this comment to Jira ticket {ticket_key}? (yes/no)
+```
+
+**On approval:**
+
+Use Atlassian MCP tool: `mcp__atlassian__addCommentToJiraIssue`
+
+**Parameters:**
+- `cloudId`: from shared constants (godaddy Atlassian cloud)
+- `issueIdOrKey`: {ticket_key}
+- `commentBody`: {formatted comment from above}
+- `contentFormat`: "markdown"
+
+**After posting:**
+- Set `validation_v6_complete = true`
+- Set `validation_jira_comment_posted = true`
+- Display: "✓ Validation results posted to {ticket_key}"
+- Workflow complete
+
+**On decline:**
+- Ask user: "Skip Jira comment? Validation results will only be shown here. (yes to skip / no to retry)"
+- If skip confirmed: mark workflow complete without posting
+- If retry: show preview again
+
+**If MCP call fails:**
+- Report error details
+- Ask: "Failed to post Jira comment. Retry? (yes/no)"
+- On yes: retry V6
+- On no: mark workflow complete (validation done, just comment failed)
+
+## Error handling
+
+**At each gate:**
+- If external system fails (Helix, Hivemind MCP, Jira MCP):
+  - Report specific error
+  - Show what was attempted
+  - Offer retry or skip option
+  - Never fabricate data
+
+**If user cancels mid-validation:**
+- Preserve all state collected so far
+- Allow resumption from last completed gate
+
+**Critical vs non-critical failures:**
+- **Critical (must stop)**: No Hivemind URL, no audience recording data, Hivemind experiment not found
+- **Non-critical (warn and continue)**: Count mismatches, null values, SRM warnings, metric errors
+
+## Output compression
+
+Keep user-facing output concise:
+- Show ✓/⚠️/❌ status indicators
+- Use thousand separators for large numbers
+- Group related checks
+- Only expand error details when warnings/failures occur
+- Use formatted previews for dry runs
+
+## State management
+
+This skill sets these state flags:
+- `validation_dependency_load_complete`
+- `validation_v1_complete`
+- `validation_v1_blocked`
+- `validation_v2_complete`
+- `validation_v2_blocked`
+- `validation_v3_complete`
+- `validation_v3_blocked`
+- `validation_v4_complete`
+- `validation_v4_blocked`
+- `validation_v5_complete`
+- `validation_v6_complete`
+- `validation_jira_comment_posted`
+- `hivemind_experiment_id`
+- `hivemind_experiment_name`
+- `experiment_launch_date` (format: YYYY-MM-DD, from Jira ticket)
+- `audience_recording_shoppers`
+- `audience_recording_resources`
+- `hivemind_total_sample_size`
+- `validation_delta_shoppers`
+- `validation_delta_shoppers_pct`
+- `validation_status`
+- `validation_critical_warnings`
+- `validation_cautionary_warnings`
+
+## Workflow completion criteria
+
+Workflow is complete when:
+- All gates V1-V6 completed successfully, OR
+- User explicitly cancels/skips, OR
+- Critical blocker prevents continuation and user declines retry
+
+## Do not use this skill for other workflows
+
+This skill is validation-only. Do not invoke during:
+- Ticket creation (T1-T4)
+- Sizing (S1-S12)
+- Setup (E1-E11)
+- Results gathering (R1-R8)
