@@ -1,0 +1,365 @@
+## Confluence Publish and Jira Link
+
+### Scope
+
+This skill applies only when `workflow_intent = size_opportunity`.
+Do not use this skill for setup-experiment workflows.
+Do not use this skill for gather-results workflows.
+Do not use this skill before final opportunity sizing validation has passed.
+
+### Purpose
+
+Publish the final opportunity sizing detail to Confluence, link the Confluence page back to Jira, and link Jira back to the Confluence page.
+
+**AUTO-EXECUTE AFTER S11:** This skill executes automatically after S11 power calculation approval. No separate dry run approval is required.
+
+Before any write operation:
+- Final sizing validation must pass.
+- S11 power calculation must be complete and user-approved.
+
+Display a brief summary of what will be written, then execute immediately.
+
+Do not modify Jira fields that are not listed in this skill.
+Do not silently skip required Jira writeback fields.
+
+### Required upstream inputs
+
+Before this skill runs, the workflow state must contain:
+- Final sizing output.
+- Final validated sizing assumptions.
+- Final power calculation output.
+- Fully baked test duration from the power calculation.
+- Jira issue key.
+- Confluence final output parent page identifier from shared constants.
+- S11 approval completed (sizing_s11_complete = true).
+
+If any required upstream input is missing, stop and return the missing requirement to the master orchestrator.
+Do not create a Confluence page.
+Do not update Jira.
+Do not fabricate missing sizing, financial, duration, Jira, or Confluence values.
+
+**Anomaly gate (checked before auto-execute):** If `sizing_anomaly_detected = true` and `sizing_anomaly_user_confirmed` is not `true`, this skill must NOT auto-execute. Stop and return control per the anomalous sizing result stop rule in `eor-renewal-experiment-worfklow-exception-handling-and-audit.md`, even though S11 has otherwise been approved. Approval of S11 output does not confirm an unresolved S9-S10 anomaly.
+
+### State fields maintained by this skill
+
+Maintain or update these state fields when available:
+
+```json
+{
+  "confluence_publish_complete": false,
+  "confluence_page_id": null,
+  "confluence_page_url": null,
+  "jira_linkback_complete": false,
+  "jira_writeback_complete": false,
+  "jira_writeback_error": null,
+  "available_jira_field_values_queried": false,
+  "fully_baked_test_duration_days": null,
+  "fully_baked_test_duration_field_id": "customfield_16515",
+  "fully_baked_test_duration_available_values": null,
+  "fully_baked_test_duration_selected_option": null,
+  "fully_baked_test_duration_mapping_method": null,
+  "estimated_financial_impact_field_id": "customfield_24800",
+  "hypothesis_field_id": "customfield_24203"
+}
+```
+
+### Execution behavior
+
+**AUTO-EXECUTE:** This skill executes automatically after S11 approval. No separate approval prompt is required.
+
+Display a brief summary before execution:
+```
+Publishing to Confluence and updating Jira...
+
+Confluence: Creating page under REN/Opportunity Sizing
+Jira Updates: customfield_16515, customfield_24800
+```
+
+Then execute Confluence and Jira writes immediately.
+
+Display completion message after writes succeed.
+
+### Confluence publishing requirements
+
+Create a child page under the final output parent page from shared constants.
+Use Confluence storage format.
+Use plain HTML tables for structured sizing details.
+Do not use unsupported markdown syntax in Confluence storage format.
+Do not create duplicate pages when a page for the same Jira issue and sizing output already exists unless the user explicitly approves creating a new page.
+
+The Confluence page must include:
+- Opportunity summary.
+- Jira issue key.
+- Audience definition summary.
+- Baseline sizing summary.
+- Power calculation summary.
+- Estimated test duration.
+- Fully baked test duration.
+- Financial impact, when available.
+- Final assumptions.
+- Caveats, limitations, and validation notes.
+- Timestamp or workflow completion marker, when available.
+
+After the Confluence page is created, capture:
+- Confluence page ID.
+- Confluence page URL.
+
+### Jira linkback requirements
+
+After the Confluence page is created, link Jira to the Confluence page.
+Also ensure the Confluence page includes a link back to the Jira issue.
+
+Do not claim linkback success unless both operations complete or the specific completed operation is clearly identified.
+If either linkback operation fails, disclose the failure and preserve the created Confluence page details.
+
+### Jira writeback fields
+
+Update the following fields when values are available and valid:
+- Estimated financial impact: `customfield_24800`, when incremental revenue is available and approved.
+- Fully baked test duration: `customfield_16515`, always sourced from the fully baked test duration from the power calculation.
+
+Conditionally include:
+- Hypothesis: `customfield_24203`, only if `lift_changed_by_user = true`.
+
+Do not write to any other Jira fields.
+
+### Fully baked duration from state
+
+Read fully_baked_experiment_duration_days from state (calculated in S11 Power Calculation skill).
+
+Do NOT recalculate fully baked duration in this skill.
+Do NOT apply timing rules here.  
+Do NOT duplicate the formulas from Power Calculation.
+
+If fully_baked_experiment_duration_days is null, missing, or invalid:
+- Flag error to user
+- Do not write customfield_16515 (Test Duration field)
+- Ask user to confirm S11 power calculation completed successfully
+- Disclose that fully baked duration is required for Jira field update
+
+The Power Calculation skill (S11) is the authoritative source for:
+- Estimated Test Duration calculation
+- Fully Baked Experiment Duration calculation
+- Communication timing rule application
+
+This skill (S12) only consumes and displays those pre-calculated values.
+
+### Jira field value discovery for customfield_16515
+
+Use the cached allowed-values table for `customfield_16515` in `eor-renewal-experiment-worfklow-shared-constants-and-field-mappings.md` as the default source. Do not perform a live Jira metadata query on every run when the cached table is available — this was measured to add avoidable latency to every publish.
+
+Use the cached table directly to:
+- Map the fully baked test duration to the closest option (see mapping rules below).
+- Get that option's ID for the write payload.
+
+Perform a live Jira query for `customfield_16515` allowed values only when any of the following is true:
+- The target issue's project is not CM or REN (the cached table was verified against both projects, issue type Story; a different project's field configuration may differ).
+- The fully baked test duration cannot be mapped to any cached option even after applying the closest-numeric-option and tie-breaking rules below (e.g., it is far outside the cached range).
+- A write attempt using a cached option ID fails with a Jira error indicating the option is invalid, unknown, or the field configuration has changed.
+- The cached table is missing, unreadable, or clearly stale (no verification date, or the calling skill has separately been told the field changed).
+
+When a live query is required, use Jira metadata for the target issue, such as edit metadata or field context metadata, to retrieve allowed values for `customfield_16515`.
+
+The Jira query must identify:
+- Field ID: `customfield_16515`.
+- Field name, if available.
+- Field schema/type, if available.
+- Whether the field is editable for the issue.
+- Allowed values or available options.
+- Option IDs, if the field requires option IDs.
+- Option display values, if the field requires display values.
+
+If Jira does not return allowed values for `customfield_16515`, retry with the appropriate Jira field context or issue edit metadata endpoint available to the agent.
+
+If the field is not editable for the issue:
+- Do not attempt the write.
+- Disclose that `customfield_16515` is not editable for the issue.
+- Include the failure in the final output.
+
+If allowed values cannot be retrieved after the available Jira metadata paths are attempted:
+- Do not write `customfield_16515`.
+- Disclose that the available values could not be retrieved.
+- Ask the master orchestrator or user for the valid Jira field option if needed.
+
+### Mapping fully baked test duration to closest Jira option
+
+After retrieving available values for `customfield_16515`, map the fully baked test duration to the closest available Jira option.
+
+Mapping requirements:
+- Use the fully baked test duration in days as the source value.
+- Parse numeric day values from each available Jira option when possible.
+- Support options expressed as single values, labels, or ranges, such as:
+  - `7 days`
+  - `14 days`
+  - `30 days`
+  - `31-60 days`
+  - `60+ days`
+  - `1 month`
+  - `2 months`
+  - `Less than 30 days`
+  - `More than 90 days`
+- Normalize months to days only when the option label clearly implies month-based duration. Use 30 days per month for option matching and disclose the normalization in the output.
+- For exact numeric matches, select the matching option.
+- For range options, select the option whose range contains the fully baked test duration.
+- For open-ended ranges, select the option if the duration falls within the open-ended condition.
+- If no exact or containing range is available, select the closest numeric option by smallest absolute difference in days.
+- If there is a tie, choose the more conservative longer-duration option.
+- If no option can be parsed into a duration or duration range, do not guess. Surface the available options and ask the user or master orchestrator to select an option.
+
+Examples:
+- Fully baked test duration = 40 days and available options include `31-60 days`, select `31-60 days`.
+- Fully baked test duration = 40 days and available options include `30 days` and `45 days`, select `45 days` because it is closest.
+- Fully baked test duration = 40 days and available options include `30 days` and `50 days`, select `50 days` because the tie should choose the longer option.
+- Fully baked test duration = 95 days and available options include `90+ days`, select `90+ days`.
+
+Record the selected option for audit as:
+- Source value: fully baked test duration in days.
+- Available Jira options retrieved.
+- Selected Jira option.
+- Selected Jira option ID, if applicable.
+- Mapping method: exact match, range containment, closest numeric option, or user-selected.
+- Mapping rationale.
+
+### Jira write payload for customfield_16515
+
+When writing `customfield_16515`, use the payload shape required by Jira metadata.
+
+If Jira metadata indicates the field is a single-select option:
+- Write the selected option ID when Jira requires an ID.
+- Write the selected option value only when Jira accepts the display value.
+
+If Jira metadata indicates the field is a text or number field:
+- Write the fully baked test duration in days using the required Jira format.
+
+If Jira metadata indicates a different schema:
+- Do not guess the payload shape.
+- Display the schema and ask the master orchestrator or user for the correct write format.
+
+Do not write `customfield_16515` with the raw numeric duration when Jira requires an option.
+Do not write an option display value when Jira requires an option ID.
+Do not write the estimated test duration to `customfield_16515`.
+
+### Estimated financial impact writeback
+
+Update `customfield_24800` when incremental revenue is available.
+
+`customfield_24800` is a Jira `number` field (float schema). It only accepts a native numeric value.
+
+Rules:
+- Use the final validated incremental revenue value from state.
+- Do not calculate a new financial impact in this skill.
+- Do not write if the value is missing or invalid.
+- Convert the value to a native number before sending: strip currency symbols (`$`), thousands separators (`,`), and any other formatting before the write. Send it as a JSON number, not a quoted string.
+- Do not send `"$1,302,349"` or `"1302349"` (a quoted string). Send `1302349` (a number).
+- If the value cannot be cleanly converted to a number, do not write it — disclose the conversion failure instead of retrying with a differently formatted string.
+
+### Hypothesis update when lift changes
+
+If the user changed the lift during lift validation, include a proposed update to `customfield_24203` in the final dry run.
+
+Rules:
+- Preserve original hypothesis content where possible.
+- Add or update a clearly labeled lift assumption line.
+- Include original lift and final confirmed lift if available.
+- Do not overwrite unrelated hypothesis content.
+- Do not write until explicit final approval.
+
+Suggested appended or updated text:
+
+```text
+Lift assumption for opportunity sizing: final confirmed lift = <value> (<absolute/relative>). Original proposed lift = <value if available>. Updated during sizing review and validation.
+```
+
+This update executes automatically when lift_changed_by_user = true. No separate approval is required.
+
+### Execution output format
+
+Before execution, display brief summary:
+
+```text
+Publishing to Confluence and updating Jira...
+
+Confluence: Creating page under REN/Opportunity Sizing
+Jira: Updating {field_count} fields (customfield_16515, customfield_24800)
+```
+
+Then execute writes immediately without approval prompt.
+
+After execution completes, show completion summary:
+- Confluence page URL
+- Jira fields updated
+- Any errors or skipped fields with reasons
+
+### Write execution order
+
+Execute writes in this order:
+1. Create Confluence child page under the configured parent page.
+2. Capture Confluence page ID and URL.
+3. Link the Confluence page back to Jira or include the Jira link in the page content.
+4. Link Jira to the Confluence page.
+5. Update Jira fields including `customfield_16515` when valid and mapped.
+6. Confirm final status to the user and master orchestrator.
+
+If Confluence creation fails:
+- Do not update Jira linkback to a missing page.
+- Do not claim publish success.
+- Disclose the failure.
+
+If Jira linkback fails after Confluence creation succeeds:
+- Preserve the Confluence page URL.
+- Disclose the Jira linkback failure.
+- Continue with Jira field writeback if safe and allowed by the workflow.
+
+If Jira field writeback fails:
+- Disclose which field failed.
+- Disclose whether Confluence publish succeeded.
+- Do not retry with a different value unless the user explicitly approves the new value.
+
+### Final output requirements
+
+After writes complete, return:
+- Confluence publish status.
+- Confluence page URL.
+- Jira linkback status.
+- Jira writeback status.
+- Updated Jira fields.
+- For `customfield_16515`, include the fully baked test duration in days, selected Jira option, option ID if used, and mapping method.
+- Any skipped fields and reasons.
+- Any errors or caveats.
+
+### Audit requirements
+
+Include an audit section:
+
+```text
+Publish and Jira writeback audit:
+- Final sizing validation passed: Yes/No
+- User approved final dry run: Yes/No
+- Confluence page created: Yes/No
+- Confluence page URL:
+- Jira issue linked to Confluence: Yes/No
+- Confluence linked to Jira: Yes/No
+- customfield_16515 included in dry run: Yes/No
+- customfield_16515 available values queried: Yes/No
+- customfield_16515 available values:
+- Fully baked test duration source:
+- Fully baked test duration days:
+- customfield_16515 selected option:
+- customfield_16515 selected option ID:
+- customfield_16515 mapping method:
+- customfield_16515 write status: Success / Failed / Skipped
+- customfield_24800 write status: Success / Failed / Skipped / Not applicable
+- customfield_24203 write status: Success / Failed / Skipped / Not applicable
+- Errors:
+```
+
+### Non-negotiable rules
+
+- Always write `customfield_16515` when fully baked test duration is available.
+- Always source `customfield_16515` from fully baked test duration from the power calculation (never estimated test duration).
+- Always have a source of allowed values for `customfield_16515` before writing it — the cached table in shared constants by default, a live Jira query when one of the fallback conditions above applies.
+- Always map the fully baked test duration to the closest available Jira option when options are available.
+- Always validate the available Jira field values or confirm the field accepts direct numeric/text input before writing.
+- Always send `customfield_24800` as a native number, never a formatted or quoted string.
+- Never fabricate Jira option IDs, duration values, financial impact, hypothesis content, Confluence URLs, or linkback status.
+- Execute automatically after S11 completes - no approval prompt required, unless the anomaly gate in `eor-renewal-experiment-worfklow-exception-handling-and-audit.md` is active.
